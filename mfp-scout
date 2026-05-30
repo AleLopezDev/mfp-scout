@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+
+# mfp-scout
+# Passive PMF/MFP/802.11w inspector for Wi-Fi packet captures.
+#
+# Usage:
+#   ./mfp-scout capture.cap
+#
+# Notes:
+#   - The best evidence comes from Association/Reassociation Request frames.
+#   - Quiet captures may not contain enough client-side information.
+#   - Use only on networks and captures you are authorized to assess.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+CAP="${1:-}"
+
+usage() {
+  cat << EOF
+Usage:
+  mfp-scout <capture.cap|capture.pcap|capture.pcapng>
+
+Examples:
+  mfp-scout wifi-corp-01.cap
+  mfp-scout ./captures/reassoc.pcapng
+
+Options:
+  -h, --help      Show this help message
+  -v, --version   Show version
+EOF
+}
+
+if [[ "${CAP}" == "-h" || "${CAP}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "${CAP}" == "-v" || "${CAP}" == "--version" ]]; then
+  echo "mfp-scout ${VERSION}"
+  exit 0
+fi
+
+if [[ -z "${CAP}" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ ! -f "${CAP}" ]]; then
+  echo "[!] Capture not found: ${CAP}" >&2
+  exit 1
+fi
+
+if ! command -v tshark >/dev/null 2>&1; then
+  echo "[!] Missing dependency: tshark" >&2
+  echo "    Debian/Ubuntu/Kali: sudo apt install tshark" >&2
+  echo "    Arch Linux:        sudo pacman -S wireshark-cli" >&2
+  exit 1
+fi
+
+# Validate Wireshark field availability early. Different very old versions may not expose these names.
+if ! tshark -G fields 2>/dev/null | grep -q $'\twlan.rsn.capabilities.mfpc\t'; then
+  echo "[!] Your tshark version does not expose wlan.rsn.capabilities.mfpc." >&2
+  echo "    Upgrade Wireshark/tshark or inspect RSN capabilities manually." >&2
+  exit 1
+fi
+
+if ! tshark -G fields 2>/dev/null | grep -q $'\twlan.rsn.capabilities.mfpr\t'; then
+  echo "[!] Your tshark version does not expose wlan.rsn.capabilities.mfpr." >&2
+  echo "    Upgrade Wireshark/tshark or inspect RSN capabilities manually." >&2
+  exit 1
+fi
+
+print_rule() {
+  printf '%s\n' "------------------------------------------------------------"
+}
+
+is_true() {
+  local value="${1:-}"
+  case "${value,,}" in
+    1|true|yes|set) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize() {
+  local value="${1:-}"
+  [[ -z "${value}" ]] && echo "unknown" || echo "${value}"
+}
+
+pmf_status() {
+  local mfpc="${1:-}"
+  local mfpr="${2:-}"
+
+  if is_true "${mfpr}"; then
+    echo "PMF required"
+  elif is_true "${mfpc}"; then
+    echo "PMF capable / optional"
+  elif [[ -z "${mfpc}" && -z "${mfpr}" ]]; then
+    echo "unknown"
+  else
+    echo "PMF not advertised"
+  fi
+}
+
+deauth_short() {
+  local mfpc="${1:-}"
+  local mfpr="${2:-}"
+
+  if is_true "${mfpr}"; then
+    echo "No classic deauth expected"
+  elif is_true "${mfpc}"; then
+    echo "Deauth uncertain"
+  elif [[ -z "${mfpc}" && -z "${mfpr}" ]]; then
+    echo "Unknown"
+  else
+    echo "Classic deauth likely"
+  fi
+}
+
+deauth_note() {
+  local mfpc="${1:-}"
+  local mfpr="${2:-}"
+
+  if is_true "${mfpr}"; then
+    echo "Protected management frames are required. Forged unprotected deauth/disassoc frames should be rejected."
+  elif is_true "${mfpc}"; then
+    echo "PMF is supported but not mandatory. A controlled test is needed to confirm deauth behavior."
+  elif [[ -z "${mfpc}" && -z "${mfpr}" ]]; then
+    echo "Not enough data. Capture association or reassociation frames from the client."
+  else
+    echo "PMF is not advertised in this frame. Classic deauth is more likely to work if radio conditions are good."
+  fi
+}
+
+echo "[*] Reading capture: ${CAP}"
+
+TMP_APS="$(mktemp)"
+TMP_CLIENTS="$(mktemp)"
+trap 'rm -f "${TMP_APS}" "${TMP_CLIENTS}"' EXIT
+
+# AP advertisements: Beacon and Probe Response.
+tshark -r "${CAP}" \
+  -Y "(wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5) && wlan.rsn" \
+  -T fields \
+  -e wlan.sa \
+  -e wlan.ssid \
+  -e wlan.rsn.capabilities.mfpc \
+  -e wlan.rsn.capabilities.mfpr 2>/dev/null \
+| awk -F'\t' 'NF >= 1 && $1 != "" {print}' \
+| sort -u > "${TMP_APS}" || true
+
+# Client association material: Association Request and Reassociation Request.
+tshark -r "${CAP}" \
+  -Y "(wlan.fc.type_subtype == 0 || wlan.fc.type_subtype == 2) && wlan.rsn" \
+  -T fields \
+  -e frame.number \
+  -e wlan.sa \
+  -e wlan.da \
+  -e wlan.bssid \
+  -e wlan.ssid \
+  -e wlan.rsn.capabilities.mfpc \
+  -e wlan.rsn.capabilities.mfpr 2>/dev/null \
+| awk -F'\t' 'NF >= 2 && $2 != "" {print}' \
+| sort -u > "${TMP_CLIENTS}" || true
+
+echo
+print_rule
+echo "Access points"
+print_rule
+
+if [[ ! -s "${TMP_APS}" ]]; then
+  echo "No AP RSN advertisements found."
+else
+  while IFS=$'\t' read -r ap ssid mfpc mfpr; do
+    [[ -z "${ap:-}" ]] && continue
+    ssid="$(normalize "${ssid:-}")"
+    status="$(pmf_status "${mfpc:-}" "${mfpr:-}")"
+
+    echo
+    echo "AP: ${ap}"
+    echo "  SSID: ${ssid}"
+    echo "  PMF:  ${status}"
+    echo "  Note: $(deauth_note "${mfpc:-}" "${mfpr:-}")"
+  done < "${TMP_APS}"
+fi
+
+echo
+print_rule
+echo "Clients"
+print_rule
+
+if [[ ! -s "${TMP_CLIENTS}" ]]; then
+  echo "No Association/Reassociation Requests with RSN capabilities were found."
+  echo "Capture while a client connects or reconnects, then run mfp-scout again."
+else
+  while IFS=$'\t' read -r frame client dst bssid ssid mfpc mfpr; do
+    [[ -z "${client:-}" ]] && continue
+
+    ssid="$(normalize "${ssid:-}")"
+    bssid="$(normalize "${bssid:-${dst:-}}")"
+    status="$(pmf_status "${mfpc:-}" "${mfpr:-}")"
+    verdict="$(deauth_short "${mfpc:-}" "${mfpr:-}")"
+
+    echo
+    echo "Client: ${client}"
+    echo "  Frame:  ${frame}"
+    echo "  SSID:   ${ssid}"
+    echo "  AP:     ${bssid}"
+    echo "  PMF:    ${status}"
+    echo "  Aireplay: ${verdict}"
+    echo "  Note:   $(deauth_note "${mfpc:-}" "${mfpr:-}")"
+  done < "${TMP_CLIENTS}"
+fi
+
+echo
+print_rule
+echo "Compact view"
+print_rule
+
+if [[ ! -s "${TMP_CLIENTS}" ]]; then
+  echo "No client-side PMF data available."
+else
+  index=1
+  while IFS=$'\t' read -r frame client dst bssid ssid mfpc mfpr; do
+    [[ -z "${client:-}" ]] && continue
+    status="$(pmf_status "${mfpc:-}" "${mfpr:-}")"
+    verdict="$(deauth_short "${mfpc:-}" "${mfpr:-}")"
+    echo "CLIENT ${index} ${client} -> ${status} (${verdict})"
+    index=$((index + 1))
+  done < "${TMP_CLIENTS}"
+fi
+
+echo
+print_rule
+echo "Summary"
+print_rule
+
+if [[ -s "${TMP_CLIENTS}" ]]; then
+  total_count="$(awk -F'\t' 'NF >= 2 {print $2}' "${TMP_CLIENTS}" | sort -u | wc -l | tr -d ' ')"
+  required_count="$(awk -F'\t' '{print tolower($7)}' "${TMP_CLIENTS}" | grep -Ec '^(1|true|yes|set)$' || true)"
+  capable_count="$(awk -F'\t' '{print tolower($6)}' "${TMP_CLIENTS}" | grep -Ec '^(1|true|yes|set)$' || true)"
+
+  echo "Clients observed:       ${total_count}"
+  echo "PMF capable entries:    ${capable_count}"
+  echo "PMF required entries:   ${required_count}"
+else
+  echo "Clients observed:       0"
+fi
+
+cat << EOF
+
+Interpretation notes:
+  PMF required              -> classic forged deauth is unlikely to work.
+  PMF capable / optional    -> deauth may work depending on negotiation and AP/client policy.
+  PMF not advertised        -> classic deauth is more likely to work.
+  unknown                   -> capture is incomplete; collect association/reassociation frames.
+
+Useful capture tip:
+  airodump-ng wlan0mon -c <channel> --essid <ssid> -w mfp-check
+EOF
